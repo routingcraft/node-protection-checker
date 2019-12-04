@@ -13,7 +13,7 @@ import sys
 #        'password': 'admin',
 #        'nodeIp': '10.83.13.98',
 #        'type': 'eos'}
-#npcNodesFile = "npc_nodes.yml"
+npcNodesFile = "npc_nodes.yml"
 
 
 
@@ -729,15 +729,19 @@ def enterManually():
     
  
 try:
-    npcNodesFile = sys.argv[1]
+    #npcNodesFile = sys.argv[1]
     try:
         with open(npcNodesFile, 'r') as ymlfile:
             npcNodes = yaml.load(ymlfile)
             for node in npcNodes:
                 connectNode = npcNodes[node]
+                print("")
                 print("Connecting to node " + npcNodes[node]['nodeIp'] + " type " + npcNodes[node]['type'])
                 print("")
-                checkNode(connectNode)
+                try:
+                    checkNode(connectNode)
+                except OSError:
+                    print("Cannot connect to node " + connectNode['nodeIp'])
     except FileNotFoundError:
         print("Cannot find file " + npcNodesFile)
         enterManually()   
