@@ -13,7 +13,7 @@ import sys
 #        'password': 'admin',
 #        'nodeIp': '10.83.13.98',
 #        'type': 'eos'}
-npcNodesFile = "npc_nodes.yml"
+#npcNodesFile = "npc_nodes.yml"
 
 
 
@@ -729,7 +729,7 @@ def enterManually():
     
  
 try:
-    #npcNodesFile = sys.argv[1]
+    npcNodesFile = sys.argv[1]
     try:
         with open(npcNodesFile, 'r') as ymlfile:
             npcNodes = yaml.load(ymlfile)
