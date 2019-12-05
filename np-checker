@@ -96,7 +96,7 @@ class isisNode(object):
                 if reachability['srPrefixReachabilities'][0]['options']['nodeSID'] == True:
                     v4NodeSid = reachability['srPrefixReachabilities'][0]['sid']
             if v4Addr != None and v4NodeSid != None:
-                nodeSids.append((v4Addr + "/32", 900000 + int(v4NodeSid)))
+                nodeSids.append((v4Addr + "/32", int(v4NodeSid)))
         return nodeSids
     def getNeighborAddr(self, adjInterfaceAddress):
         for adjacency in self.isisDbEntry['neighbors']:
@@ -188,27 +188,27 @@ def checkPrefixSids(prefixSids, tilfaPaths):
                     linkProtectedPrefixSid[hostname]
                 except KeyError:            
                     linkProtectedPrefixSid[hostname] = []
-                linkProtectedPrefixSid[hostname].append((prefixSid['prefix'], 900000 + int(prefixSid['segmentId'])))
+                linkProtectedPrefixSid[hostname].append((prefixSid['prefix'], int(prefixSid['segmentId'])))
             else:
                 try:
                     unprotectedPrefixSid[hostname]
                 except KeyError:
                     unprotectedPrefixSid[hostname] = []
-                unprotectedPrefixSid[hostname].append((prefixSid['prefix'], 900000 + int(prefixSid['segmentId'])))
+                unprotectedPrefixSid[hostname].append((prefixSid['prefix'], int(prefixSid['segmentId'])))
         elif prefixSid['selfOriginatedPrefix'] is None and prefixSid['protection'] == 'node':
             hostname = prefixSid['hostname']
             try:
                 nodeProtectedPrefixSid[hostname]
             except KeyError:
                 nodeProtectedPrefixSid[hostname] = []
-            nodeProtectedPrefixSid[hostname].append((prefixSid['prefix'], 900000 + int(prefixSid['segmentId'])))
+            nodeProtectedPrefixSid[hostname].append((prefixSid['prefix'], int(prefixSid['segmentId'])))
         elif prefixSid['selfOriginatedPrefix'] is None and prefixSid['protection'] == 'unprotected':
             hostname = prefixSid['hostname']
             try: 
                 unprotectedPrefixSid[hostname]
             except KeyError:            
                 unprotectedPrefixSid[hostname] = []
-            unprotectedPrefixSid[hostname].append((prefixSid['prefix'], 900000 + int(prefixSid['segmentId'])))                   
+            unprotectedPrefixSid[hostname].append((prefixSid['prefix'], int(prefixSid['segmentId'])))                   
     return linkProtectedPrefixSid, nodeProtectedPrefixSid, unprotectedPrefixSid
  
 
