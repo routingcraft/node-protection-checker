@@ -1,0 +1,10 @@
+R1: 
+    username: "admin"
+    password: "admin"
+    nodeIp: "10.83.13.98"
+    type: "eos"
+R2: 
+    username: "admin"
+    password: "admin"
+    nodeIp: "10.83.13.99"
+    type: "eos"

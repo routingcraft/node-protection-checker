@@ -1,0 +1,746 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from pprint import pprint
+from jsonrpclib import Server
+import copy
+import yaml
+from getpass import getpass
+import sys
+
+
+
+class getIsisFacts(object):
+    # receives json rpc connection object
+    # calls eAPI commands on that object
+    def __init__(self, connection, isisProcessInfo):
+        self.connection = connection
+        self.isisProcessInfo = isisProcessInfo
+    def isisSummary(self):
+        return isisProcess(self.isisProcessInfo)
+    def isisDatabase(self, level):
+        isisName = self.isisSummary().processName()
+        return self.connection.runCmds( 1,[ "show isis " + isisName + " database level-" + level + " detail"])[0]['vrfs']['default']['isisInstances'][isisName]['level'][level]['lsps']
+    def srPrefixSids(self, addressFamily, level):
+        # returns prefix SIDs for the given AF and level
+        isisName = self.isisSummary().processName()
+        getPrefixSids = self.connection.runCmds( 1,[ "show isis " + isisName + " segment-routing prefix-segments " + addressFamily])[0]['vrfs']['default']['isisInstances'][isisName]['prefixSegments']
+        returnPrefixSids = []
+        for prefixSid in getPrefixSids:
+            if str(prefixSid['level']) == level:
+                returnPrefixSids.append(prefixSid)
+        return returnPrefixSids 
+    def isisHostnames(self):
+        isisName = self.isisSummary().processName()
+        return self.connection.runCmds( 1,[ "show isis " + isisName + " hostname"])[0]['vrfs']['default']['isisInstances'][isisName]['systemIds']
+    def tilfaPaths(self):
+        return self.connection.runCmds( 1,[ "show isis ti-lfa path detail"])[0]['vrfs']['default']
+    
+class isisProcess(object):
+    # parses the output of "show isis summary"
+    def __init__(self, isisProcessInfo):
+        self.isisProcessInfo = isisProcessInfo
+    def processName(self):
+        for key in self.isisProcessInfo.keys():
+            isisName = key
+        return isisName
+    def hostname(self):
+        return self.isisProcessInfo[self.processName()]['hostName']
+    def addressFamily(self):
+        return self.isisProcessInfo[self.processName()]['addressFamily']
+    def isType(self):
+        return self.isisProcessInfo[self.processName()]['isType']
+    def multiTopology(self):
+        return self.isisProcessInfo[self.processName()]['multiTopologyEnabled']
+    def systemId(self):
+        return self.isisProcessInfo[self.processName()]['systemId'] 
+    
+class isisNode(object):   
+    def __init__(self, isisDbEntry):
+        self.isisDbEntry = isisDbEntry
+    def isPseudonode(self):
+        return False
+    def hostname(self):
+        return self.isisDbEntry['hostname']['name']
+    def adjacencies(self):
+      adjacencies = []
+      for neighbor in self.isisDbEntry['neighbors']:
+          if neighbor['adjTopoId'] is None:              
+              if neighbor['systemId'].split(".")[1] == '00':
+                  # a real router
+                  adjacency = {}
+                  adjacency['neighbor'] = neighbor['systemId'].split(".")[0]
+                  adjacency['metric'] = neighbor['metric']
+                  adjacency['neighborAddr'] = neighbor['neighborAddr']
+                  adjacency['adjInterfaceAddress'] = neighbor['adjInterfaceAddresses'][0]['adjInterfaceAddress']
+                  adjacencies.append(adjacency)
+              else:
+                  # a pseudonode
+                  adjacency = {}
+                  adjacency['neighbor'] = neighbor['systemId']
+                  adjacency['metric'] = neighbor['metric']
+                  # neighborAddr for pseudonode will be None
+                  adjacency['neighborAddr'] = neighbor['neighborAddr']
+                  adjacencies.append(adjacency)
+      return adjacencies
+    def nodeSids(self):
+        # for now this method is not used anywhere
+        # it can be useful to find multihomed SID (or maybe better to mount to sysdb and check there)
+        # /ar/Sysdb/segmentrouting/isis/default/pfxSegmentFlagsTable/
+        nodeSids = []
+        for reachability in self.isisDbEntry['reachabilities']:
+            v4Addr = None
+            v4NodeSid = None
+            if reachability['reachabilityTopoId'] is None and reachability['maskLength'] == 32:
+                v4Addr = reachability['reachabilityV4Addr']
+                if reachability['srPrefixReachabilities'][0]['options']['nodeSID'] == True:
+                    v4NodeSid = reachability['srPrefixReachabilities'][0]['sid']
+            if v4Addr != None and v4NodeSid != None:
+                nodeSids.append((v4Addr + "/32", 900000 + int(v4NodeSid)))
+        return nodeSids
+    def getNeighborAddr(self, adjInterfaceAddress):
+        for adjacency in self.isisDbEntry['neighbors']:
+            if adjacency['systemId'].split(".")[1] == '00':
+                if adjacency['adjInterfaceAddresses'][0]['adjInterfaceAddress'] == adjInterfaceAddress:
+                    return adjacency['neighborAddr']
+    def dbOverload(self):
+        return self.isisDbEntry['flags']['dbOverload']
+    def removeAdjacency(self, adjInterfaceAddress):
+        # removes one specific adjacency to a real (non-pseudonode) neighbor
+        newIsisDbEntry = copy.deepcopy(self.isisDbEntry)
+        for adjacency in self.isisDbEntry['neighbors']:
+            if adjacency['systemId'].split(".")[1] == '00':
+                if adjacency['adjInterfaceAddresses'][0]['adjInterfaceAddress'] == adjInterfaceAddress:
+                    newIsisDbEntry['neighbors'].remove(adjacency)
+        self.isisDbEntry = newIsisDbEntry
+    def removeNeighbor(self, removedNeighbor):
+        # removes all adjacencies to neighbor (can be pseudonode as well)
+        newIsisDbEntry = copy.deepcopy(self.isisDbEntry)
+        for neighbor in self.isisDbEntry['neighbors']:
+            if neighbor['systemId'].split(".")[1] == '00':
+                neighborNode = neighbor['systemId'].split(".")[0]
+            else:
+                # neighbor is pseudonode
+                neighborNode = neighbor['systemId']
+            if neighborNode == removedNeighbor:           
+                newIsisDbEntry['neighbors'].remove(neighbor)
+        self.isisDbEntry = newIsisDbEntry
+        
+
+class isisPseudoNode(object):   
+    def __init__(self, lspId, isisDbEntry):
+        self.lspId = lspId
+        self.isisDbEntry = isisDbEntry
+    def isPseudonode(self):
+        return True
+    def hostname(self):
+        nsap = self.lspId.split('.')[-1].split('-')[0]
+        hostname = self.lspId.split('.')[0:-1]
+        hostname = ".".join(hostname)
+        hostname = isisHostnames[hostname]['hostname']
+        hostname = hostname + '.' + nsap
+        return hostname
+    def adjacencies(self):
+      adjacencies = []
+      for neighbor in self.isisDbEntry['neighbors']:
+          if neighbor['adjTopoId'] is None:
+              adjacency = {}
+              adjacency['neighbor'] = neighbor['systemId'].split(".")[0]
+              adjacency['metric'] = neighbor['metric']
+              adjacencies.append(adjacency)
+      return adjacencies
+    def removeNeighbor(self, removedNeighbor):
+        newIsisDbEntry = copy.deepcopy(self.isisDbEntry)
+        for neighbor in self.isisDbEntry['neighbors']:
+            neighborNode = neighbor['systemId'].split(".")[0]
+            if neighborNode == removedNeighbor:  
+                newIsisDbEntry['neighbors'].remove(neighbor)
+        self.isisDbEntry = newIsisDbEntry
+        
+        
+        
+
+def connectToNode(connectNode):
+    return Server( "http://" + connectNode['username'] + ":" + connectNode['password'] + "@" + connectNode['nodeIp'] + "/command-api")
+
+
+
+def checkPrefixSids(prefixSids, tilfaPaths):
+    # check all current prefix sids
+    # returns sids for which link protection is enabled
+    # and those for which it is not enabled or not supported (without N flag, ECMP etc)
+    # sids for which link/node protection is enabled but cannot be achieved due to topology constraints, are shown as unprotected
+    # sids for which node protection is enabled but only link protection possible, are not counted and are still shown as node-protected
+    linkProtectedPrefixSid = {}
+    nodeProtectedPrefixSid = {}
+    unprotectedPrefixSid = {}
+    for prefixSid in prefixSids:
+        if prefixSid['selfOriginatedPrefix'] is None and prefixSid['protection'] == 'link':
+            hostname = prefixSid['hostname']
+            systemId = prefixSid['systemId']
+            # check if TI-LFA backup path actually exists
+            pathFound = False
+            for pathId in tilfaPaths[systemId]['pathIds']:
+                if tilfaPaths[systemId]['pathIds'][pathId]['status'] == 'pathFound':
+                    pathFound = True
+            if pathFound == True:
+                try: 
+                    linkProtectedPrefixSid[hostname]
+                except KeyError:            
+                    linkProtectedPrefixSid[hostname] = []
+                linkProtectedPrefixSid[hostname].append((prefixSid['prefix'], 900000 + int(prefixSid['segmentId'])))
+            else:
+                try:
+                    unprotectedPrefixSid[hostname]
+                except KeyError:
+                    unprotectedPrefixSid[hostname] = []
+                unprotectedPrefixSid[hostname].append((prefixSid['prefix'], 900000 + int(prefixSid['segmentId'])))
+        elif prefixSid['selfOriginatedPrefix'] is None and prefixSid['protection'] == 'node':
+            hostname = prefixSid['hostname']
+            try:
+                nodeProtectedPrefixSid[hostname]
+            except KeyError:
+                nodeProtectedPrefixSid[hostname] = []
+            nodeProtectedPrefixSid[hostname].append((prefixSid['prefix'], 900000 + int(prefixSid['segmentId'])))
+        elif prefixSid['selfOriginatedPrefix'] is None and prefixSid['protection'] == 'unprotected':
+            hostname = prefixSid['hostname']
+            try: 
+                unprotectedPrefixSid[hostname]
+            except KeyError:            
+                unprotectedPrefixSid[hostname] = []
+            unprotectedPrefixSid[hostname].append((prefixSid['prefix'], 900000 + int(prefixSid['segmentId'])))                   
+    return linkProtectedPrefixSid, nodeProtectedPrefixSid, unprotectedPrefixSid
+ 
+
+def getIsisLsdb(connection, level, isisProcessInfo):
+    isisLsdb = {}
+    fullIsisDb = getIsisFacts(connection, isisProcessInfo).isisDatabase(level)
+    isisHostnames = getIsisFacts(connection, isisProcessInfo).isisHostnames()
+    for lspId in fullIsisDb:
+        # if NSAP is not 00, this is a pseudonode LSP
+        nsap = lspId.split('.')[-1].split('-')[0]
+        if nsap != '00':
+            isisNodeObj = isisPseudoNode(lspId, fullIsisDb[lspId])
+            isisLsdb[isisNodeObj.hostname()] = isisNodeObj         
+        else:   
+            isisNodeObj = isisNode(fullIsisDb[lspId])
+            isisLsdb[isisNodeObj.hostname()] = isisNodeObj
+    return isisLsdb
+
+
+
+    
+def excludeLink(excludedLink, isisLsdb):
+    newIsisLsdb = copy.deepcopy(isisLsdb)
+    for node in excludedLink.keys():
+        newIsisLsdb[node].removeAdjacency(excludedLink[node])
+    return newIsisLsdb
+
+
+def excludeNode(excludedNode, isisLsdb):
+    newIsisLsdb = copy.deepcopy(isisLsdb)    
+    for node in isisLsdb.keys():
+        newIsisLsdb[node].removeNeighbor(excludedNode)
+    del newIsisLsdb[excludedNode]
+    return newIsisLsdb
+    
+def removeUnidirectionalLinks(isisLsdb):
+    newIsisLsdb = copy.deepcopy(isisLsdb)
+    for firstNode in isisLsdb:
+        for firstAdjacency in isisLsdb[firstNode].adjacencies():
+            uniLink = True
+            secondNode = firstAdjacency['neighbor']             
+            for secondAdjacency in isisLsdb[secondNode].adjacencies():
+                # for links between non-pseudonodes, check interface IP
+                # because there can be multiple links and some of them are unidirectional
+                if isisLsdb[firstNode].isPseudonode() == False and isisLsdb[secondNode].isPseudonode() == False:
+                    if secondAdjacency['neighbor'] == firstNode and secondAdjacency['neighborAddr'] == firstAdjacency['adjInterfaceAddress']:
+                        uniLink = False
+                # for pseudonodes, only check neighbors
+                elif secondAdjacency['neighbor'] == firstNode:
+                    uniLink = False
+            if uniLink == True:
+                if isisLsdb[firstNode].isPseudonode() == False and isisLsdb[secondNode].isPseudonode() == False:
+                    newIsisLsdb[firstNode].removeAdjacency(firstAdjacency['adjInterfaceAddress'])
+                else:
+                    newIsisLsdb[firstNode].removeNeighbor(secondNode)
+
+    return newIsisLsdb
+    
+def dijkstraVias(root, isisLsdb):
+
+    unvisited = {node: None for node in isisLsdb.keys()} #using None as +inf
+    visited = {}
+    current = root
+    currentDistance = 0
+    unvisited[current] = currentDistance
+
+
+    vias = {}
+    for node in isisLsdb.keys():
+        vias[node] = []
+
+    nextHops = {}
+    for node in isisLsdb.keys():
+        nextHops[node] = []
+    
+    while True:
+        visited[current] = {}
+        
+        dbOverload = False
+        if isisLsdb[current].isPseudonode() == False:
+            if current != root and isisLsdb[current].dbOverload() == True:               
+                dbOverload = True
+                
+        for adjacency in isisLsdb[current].adjacencies():
+            # if current has overload bit, it can't be in transit (neither for primary nor for backup path), so don't discover his neighbors
+            # on the other hand, SID local to node with overload bit can be protected, or PLR can have overload bit - this is fine too
+            if dbOverload == True: continue
+            neighbor = adjacency['neighbor']
+            metric = adjacency['metric']
+            if isisLsdb[current].isPseudonode() == False:
+                neighborAddr = adjacency['neighborAddr']
+            
+            if neighbor not in unvisited: continue
+
+            newDistance = currentDistance + metric
+            
+            if unvisited[neighbor] is None or unvisited[neighbor] > newDistance:
+                # if a non-inf metric path already exists to neighbor, but a better path found
+                # delete the list of vias and nexthops for worse metric path
+                if unvisited[neighbor] is not None:
+                    vias[neighbor] = []
+                    nextHops[neighbor] = []
+                unvisited[neighbor] = newDistance
+                # add intermediate nodes
+                # this is done in 2 steps:
+                #
+                # 1) if vias for current has any items, append them in order
+                # 2) append current, except the case when current=root
+            
+                if current in vias.keys():
+                    for intermNode in vias[current]:
+                        if intermNode != root and isisLsdb[intermNode].isPseudonode() == False:
+                            vias[neighbor].append(intermNode)                          
+                            
+                if current != root and isisLsdb[current].isPseudonode() == False:
+                    vias[neighbor].append(current)
+                
+                # add nextHops:
+                # if we are at root, add nexthop to neighbour
+                # else, copy nexthop of root to us
+                # if neighbor is a pseudonode, nextHops 'None' will be appended
+                # this is expected as TI-LFA doesn't work on multiaccess links, prefixes with such nexthops will be unprotected
+                
+                if current == root:
+                    nextHops[neighbor].append((neighbor, neighborAddr))
+                else:
+                    nextHops[neighbor] = nextHops[current][:]
+
+            elif unvisited[neighbor] == newDistance:
+                # ECMP route found
+                if current in vias.keys():
+                    for intermNode in vias[current]:
+                        if intermNode != root and intermNode not in vias[neighbor] and isisLsdb[intermNode].isPseudonode() == False:
+                            vias[neighbor].append(intermNode)
+                if current != root and current not in vias[neighbor] and isisLsdb[current].isPseudonode() == False:
+                    vias[neighbor].append(current)
+                # add nextHops:
+                if current == root:
+                    nextHops[neighbor].append((neighbor, neighborAddr))
+                else:
+                    for nextHop in nextHops[current]:
+                        if nextHop not in nextHops[neighbor]:
+                            nextHops[neighbor].append(nextHop)
+
+
+
+        visited[current]['metric'] = currentDistance
+        del unvisited[current]
+        if not unvisited: break
+    
+        
+        # candidates to be next current are unvisited nodes to which we already know path
+        # pseudonodes have priority, otherwise some ECMP nexthops might be not discovered
+        # see The Complete ISIS Routing Protocol chapter 10.2.3
+        candidates = [node for node in unvisited.items() if node[1]]
+        if not candidates: break
+        pnCandidates = []
+        for candidate in candidates:
+            if isisLsdb[candidate[0]].isPseudonode() == True:
+                pnCandidates.append(candidate)
+                
+        if len(pnCandidates) > 0:
+            current, currentDistance = sorted(pnCandidates, key = lambda x: x[1])[0]
+        else:
+            current, currentDistance = sorted(candidates, key = lambda x: x[1])[0]
+        
+
+    for dstNode in visited.keys():
+        visited[dstNode]['via'] = vias[dstNode]
+
+    for dstNode in visited.keys():
+        visited[dstNode]['nextHops'] = nextHops[dstNode]
+        
+    for dstNode in visited.keys():
+        if len(visited[dstNode]['nextHops']) > 1:
+            visited[dstNode]['ecmp'] = True
+        else:
+            visited[dstNode]['ecmp'] = False
+    # remove pseudonodes
+    pseudonodes = []
+    for dstNode in visited:
+        if dstNode.split('.')[0] != dstNode.split('.')[-1]:
+            pseudonodes.append(dstNode)
+    for node in pseudonodes:
+        del visited[node]
+    
+    # nodes (excluding pseudonodes) to which no path has been found
+    # it's important to track those since some nodes might become isolated once we exclude certain links or nodes from SPF
+    
+    isolatedNodes = []
+    for dstNode in unvisited.keys():
+        if dstNode.split('.')[0] == dstNode.split('.')[-1]:
+            isolatedNodes.append(dstNode)
+    
+    
+    return(visited, isolatedNodes)
+
+
+def isNextHopPseudonode(nextHops, isisLsdb):
+    for nextHop in nextHops:
+        if isisLsdb[nextHop[0]].isPseudonode() == True:
+            return True
+
+def isEcmpViaSameNode(nextHops):
+    nexthopNodes = []
+    for nextHop in nextHops:
+        if nextHop[0] in nexthopNodes:
+            return True
+        else: 
+            nexthopNodes.append(nextHop[0])
+            
+            
+def cascadeProtection(dstNode, cascadeNodes, postConvergenceWithoutLink, cascadeProtectedNodes, deFactoUnprotectedNodes, isisLsdb):
+    # this is a recursive function to check cascade protection for dst node
+    # assumes link protection enabled on every node on the post-convergence SPT
+    # see rfc6571#section-2
+    # for each intermNode on post-convergence SPT, check if De Facto node protection is applicable
+    # if nexthopNode is not on post-convergence SPT from intermNode to dstNode, success
+    # if nexthopNode still on post-convergence SPT, move to next intermNode and call the same function 
+    for intermNode in postConvergenceWithoutLink:
+        intermVisited, crap = dijkstraVias(intermNode, isisLsdb)
+        if isNextHopPseudonode(intermVisited[dstNode]['nextHops'], isisLsdb) == True or isEcmpViaSameNode(intermVisited[dstNode]['nextHops']) == True:        
+            if dstNode not in deFactoUnprotectedNodes:
+                deFactoUnprotectedNodes.append(dstNode)      
+        elif len(intermVisited[dstNode]['via']) > 0:
+            for nextHop in intermVisited[dstNode]['nextHops']:
+                nexthopNode, nexthopAddr = nextHop
+                nexthopLink = {}
+                nexthopLink[intermNode] = isisLsdb[nexthopNode].getNeighborAddr(nexthopAddr)
+                nexthopLink[nexthopNode] = nexthopAddr
+                isisLsdbWithoutLink = excludeLink(nexthopLink, isisLsdb)
+                
+                visitedWithoutLink, crap = dijkstraVias(intermNode, isisLsdbWithoutLink)
+                postConvergenceWithoutLink = visitedWithoutLink[dstNode]['via']
+                                
+                # track all nodes in cascade to make sure there is no loop
+                if intermNode not in cascadeNodes:
+                    cascadeNodes.append(intermNode)
+                for node in cascadeNodes:              
+                    if node in postConvergenceWithoutLink:
+                    # one of previous intermNodes in cascade is on post-convergence SPT for current intermNode towards dstNode 
+                    # therefore, no De Facto protection is possible for this dstNode
+                    # this includes the case when post-convergence SPT from intermNode is ECMP, with one of routes pointing back to previous node in cascade
+                    # in reality, in this case De Facto LFA might work (depending on tie breakers)
+                    # but it's better to be conservative, hence assuming it will not work
+                        deFactoUnprotectedNodes.append(dstNode)
+                if dstNode in deFactoUnprotectedNodes:
+                    pass
+                elif nexthopNode not in postConvergenceWithoutLink:
+                    cascadeProtectedNodes.append(dstNode)
+                else:
+                    cascadeProtection(dstNode, cascadeNodes, postConvergenceWithoutLink, cascadeProtectedNodes, deFactoUnprotectedNodes, isisLsdb)
+
+def printSidStats(linkProtectedPrefixSid, node, count, reason=''):
+    try:
+        linkProtectedPrefixSid[node]
+        for prefixAndSid in linkProtectedPrefixSid[node]:
+            (prefix, sid) = prefixAndSid
+            print("{0:<15} {1:<10} {2:<10} {3:}".format(prefix, sid, node, reason))
+            count += 1           
+    except KeyError:
+        pass
+    return count
+
+
+
+def deFactoNodeProtectionChecker(addressFamily, level, connection, root, isisProcessInfo, linkProtectedPrefixSid):
+
+    # get topology
+    isisLsdb = getIsisLsdb(connection, level, isisProcessInfo)
+    
+    isisLsdb = removeUnidirectionalLinks(isisLsdb)
+    
+    # run pre-convergence dikstra 
+    visited, crap = dijkstraVias(root, isisLsdb)
+    del visited[root]
+
+
+
+    directlyConnectedNodes = [] 
+    nodesViaPseudonode = [] # nobody supports TI-LFA on multiaccess links
+    nodesEcmpViaSameNode = [] # if ECMP are via the same node, link protection is possible but no node protection (unless SRLG is enabled)
+    eligibleNodes = [] 
+    deFactoProtectedNodes = [] # de facto type 1
+    cascadeProtectedNodes = [] # de facto type 2 (cascade)
+    deFactoUnprotectedNodes = []
+    unprotectedNodes = [] # no node protection possible for these
+    nodeProtectedNodes = [] # explicit node protection required
+
+    for dstNode in visited.keys():
+        if len(visited[dstNode]['via']) == 0:
+            directlyConnectedNodes.append(dstNode)            
+        elif isNextHopPseudonode(visited[dstNode]['nextHops'], isisLsdb) == True:
+            nodesViaPseudonode.append(dstNode)
+        elif isEcmpViaSameNode(visited[dstNode]['nextHops']) == True:
+            nodesEcmpViaSameNode.append(dstNode)
+        else:
+            eligibleNodes.append(dstNode)
+        
+
+     
+    for dstNode in eligibleNodes:
+        
+        # check every nexthop, in case of ECMP
+        # if ECMP points to different nexthop nodes, this is a valid case for de facto node protection
+        # ECMP routes pointing to the same nexthop node were filtered earlier
+        for nextHop in visited[dstNode]['nextHops']:
+            nexthopNode, nexthopAddr = nextHop 
+            nexthopLink = {}
+            nexthopLink[root] = isisLsdb[nexthopNode].getNeighborAddr(nexthopAddr)
+            nexthopLink[nexthopNode] = nexthopAddr
+            isisLsdbWithoutLink = excludeLink(nexthopLink, isisLsdb)
+    
+            visitedWithoutLink, isolatedNodes = dijkstraVias(root, isisLsdbWithoutLink)
+            # isolatedNodes here are those for which even link protection is impossible
+            # assuming TI-LFA implementation will show them as unprotected, so no need to track them additionally
+            if dstNode not in isolatedNodes:
+                postConvergenceWithoutLink = visitedWithoutLink[dstNode]['via']
+
+                if nexthopNode not in postConvergenceWithoutLink:
+                    if dstNode not in deFactoProtectedNodes:
+                        deFactoProtectedNodes.append(dstNode)
+                else:
+                    cascadeNodes = []
+                    cascadeNodes.append(root)
+                    cascadeProtection(dstNode, cascadeNodes, postConvergenceWithoutLink, cascadeProtectedNodes, deFactoUnprotectedNodes, isisLsdb)
+            
+
+    # for each deFactoUnprotectedNodes, check if it can be protected by usual node protection
+        
+    for dstNode in deFactoUnprotectedNodes:
+        for nextHop in visited[dstNode]['nextHops']:
+            nexthopNode, nexthopAddr = nextHop
+            isisLsdbWithoutNode = excludeNode(nexthopNode, isisLsdb)        
+            visitedWithoutNode, isolatedNodes = dijkstraVias(root, isisLsdbWithoutNode)
+        
+            if dstNode in isolatedNodes and dstNode not in unprotectedNodes:
+                unprotectedNodes.append(dstNode)
+            elif dstNode not in nodeProtectedNodes:
+                nodeProtectedNodes.append(dstNode)
+        
+
+    deFactoType1Count = 0
+    deFactoType2Count = 0
+    nodeProtectionCount = 0
+    
+    print("")
+    print("")
+    print("")
+    print("Level: " + level)
+    print("Address Family: " + addressFamily)
+    print("")
+    print("De Facto Protected SID type 1")
+    print("{0:<15} {1:<10} {2:}".format("Prefix", "SID", "System ID"))
+    for node in eligibleNodes:
+        if node in deFactoProtectedNodes:
+            deFactoType1Count = printSidStats(linkProtectedPrefixSid, node, deFactoType1Count)
+            
+    print("")
+    print("De Facto Protected SID type 2")
+    print("{0:<15} {1:<10} {2:}".format("Prefix", "SID", "System ID"))
+
+    for node in eligibleNodes:
+        if node in cascadeProtectedNodes:
+            deFactoType2Count = printSidStats(linkProtectedPrefixSid, node, deFactoType2Count)
+            
+    print("")
+    print("SID that require node protection")
+    print("{0:<15} {1:<10} {2:}".format("Prefix", "SID", "System ID"))
+
+    for node in eligibleNodes:
+        if node in nodeProtectedNodes:
+            nodeProtectionCount = printSidStats(linkProtectedPrefixSid, node, nodeProtectionCount)
+        
+    totalProtectedCount = deFactoType1Count + deFactoType2Count + nodeProtectionCount
+    if totalProtectedCount == 0:
+        print("No SID with possible node protection on " + root)
+    else:   
+        deFactoType1Coverage = round(100*(deFactoType1Count/totalProtectedCount), 2)
+        deFactoTotalCoverage = round(100*(deFactoType1Count + deFactoType2Count)/totalProtectedCount, 2)
+        print("")
+        print("De Facto type 1 coverage: " + str(deFactoType1Coverage) + "%")
+        print("De Facto total coverage: " + str(deFactoTotalCoverage) + "%")
+
+    print("")
+    print("Link-protected SID with no node protection possible")
+    print("{0:<15} {1:<10} {2:<10} {3:}".format("Prefix", "SID", "System ID", "Reason unprotected"))
+
+    for node in directlyConnectedNodes:
+        printSidStats(linkProtectedPrefixSid, node, 0, "Directly connected to PLR")
+
+    for node in unprotectedNodes:
+        printSidStats(linkProtectedPrefixSid, node, 0, "SID isolated in case of node failure")
+
+    return (totalProtectedCount, deFactoType1Count, deFactoType2Count, nodeProtectionCount)
+
+
+def checkNode(connectNode):
+    # connect to router
+    connection = connectToNode(connectNode)
+    isisProcessInfo = connection.runCmds( 1,[ "show isis summary"])[0]['vrfs']['default']['isisInstances']
+    isisHostnames = getIsisFacts(connection, isisProcessInfo).isisHostnames()
+    
+    root = getIsisFacts(connection, isisProcessInfo).isisSummary().hostname()
+    
+    afEnabled = []
+    
+    if isisProcess(isisProcessInfo).addressFamily() == 'ipv4' or isisProcess(isisProcessInfo).addressFamily() == 'both':
+        afEnabled.append('ipv4')
+        
+    if isisProcess(isisProcessInfo).addressFamily() == 'ipv6' or isisProcess(isisProcessInfo).addressFamily() == 'both':
+        afEnabled.append('ipv6')
+    
+    levelEnabled = []
+    
+    if isisProcess(isisProcessInfo).isType() == 'level1' or isisProcess(isisProcessInfo).isType() == 'level1-2':
+        levelEnabled.append('1')
+        
+    if isisProcess(isisProcessInfo).isType() == 'level2' or isisProcess(isisProcessInfo).isType() == 'level1-2':
+        levelEnabled.append('2')
+    
+    print("IS-IS instance " + isisProcess(isisProcessInfo).processName() + " on " + isisProcess(isisProcessInfo).hostname())
+    print("*Note: only SID with active link protection are checked")
+    print("")
+    if 'ipv6' in afEnabled and isisProcess(isisProcessInfo).multiTopology() == True:
+        print("TI-LFA is not supported for multi-topology IS-IS. Ignoring IPv6.")
+        afEnabled.remove('ipv6')
+    
+    # export all prefix SIDs and identify node SIDs with link protection currently enabled
+    allTilfaPaths = getIsisFacts(connection, isisProcessInfo).tilfaPaths()
+    
+    levelAf = []
+    
+    for addressFamily in afEnabled:
+        if addressFamily == 'ipv4':
+            try:
+                allTilfaPaths['v4Info']
+                if 'ipv4' in afEnabled:
+                    for level in levelEnabled:
+                        try:
+                            allTilfaPaths['v4Info']['topologies'][level]
+                            levelAf.append(('ipv4', level))
+                        except KeyError:
+                            print("IPv4 routing enabled for level " + level + " but no level " + level + " prefixed protected by TI-LFA. Ignoring level " + level + " for IPv4.")
+            except KeyError:
+                print("IPv4 routing enabled in IS-IS but no IPv4 prefixes protected by TI-LFA. Ignoring IPv4")
+                
+        elif addressFamily == 'ipv6':
+            try:
+                allTilfaPaths['v6Info']
+                if 'ipv6' in afEnabled:
+                    for level in levelEnabled:
+                        try:
+                            allTilfaPaths['v6Info']['topologies'][level]
+                            levelAf.append(('ipv6', level))
+                        except KeyError:
+                            print("IPv6 routing enabled for level " + level + " but no level " + level + " prefixed protected by TI-LFA. Ignoring level " + level + " for IPv6.")
+            except KeyError:
+                print("IPv6 routing enabled in IS-IS but no IPv6 prefixes protected by TI-LFA. Ignoring IPv6")
+    
+    
+    
+    globalTotalProtectedCount = 0
+    globalDeFactoType1Count = 0
+    globalDeFactoType2Count = 0
+    globalNodeProtectionCount = 0
+    
+    for addressFamily, level in levelAf:
+        if addressFamily == 'ipv4':
+            afInfo = 'v4Info'
+        elif addressFamily == 'ipv6':
+            afInfo = 'v6Info'
+        prefixSids = getIsisFacts(connection, isisProcessInfo).srPrefixSids(addressFamily, level)
+        tilfaPaths = allTilfaPaths[afInfo]['topologies'][level]['destinations']
+        linkProtectedPrefixSid, nodeProtectedPrefixSid, unprotectedPrefixSid = checkPrefixSids(prefixSids, tilfaPaths)
+        totalProtectedCount, deFactoType1Count, deFactoType2Count, nodeProtectionCount = deFactoNodeProtectionChecker(addressFamily, level, connection, root, isisProcessInfo, linkProtectedPrefixSid)
+        
+        globalTotalProtectedCount += totalProtectedCount
+        globalDeFactoType1Count += deFactoType1Count
+        globalDeFactoType2Count += deFactoType2Count
+        globalNodeProtectionCount += nodeProtectionCount
+        
+        
+        
+    if len(levelAf) > 1:
+        print("")
+        print("")
+        print("")
+        if globalTotalProtectedCount == 0:
+            print("No SID with possible node protection on " + root)
+        else:
+            deFactoType1Coverage = round(100*(globalDeFactoType1Count/globalTotalProtectedCount), 2)
+            deFactoTotalCoverage = round(100*(globalDeFactoType1Count + globalDeFactoType2Count)/globalTotalProtectedCount, 2)
+            print("Summary statistics for all address families and levels:")
+            print("")
+            print("De Facto type 1 coverage: " + str(deFactoType1Coverage) + "%")
+            print("De Facto total coverage: " + str(deFactoTotalCoverage) + "%")
+    
+    
+def enterManually():    
+    
+    print("Enter credentials manually")
+    connectNode = {}
+    connectNode['nodeIp'] = input("Router IP: ")
+    connectNode['username'] = input("Username: ")
+    connectNode['password'] = getpass("Password: ")
+    connectNode['type'] = "eos"
+    checkNode(connectNode)
+    
+    
+    
+ 
+try:
+    npcNodesFile = sys.argv[1]
+    try:
+        with open(npcNodesFile, 'r') as ymlfile:
+            npcNodes = yaml.load(ymlfile)
+            for node in npcNodes:
+                connectNode = npcNodes[node]
+                print("")
+                print("Connecting to node " + npcNodes[node]['nodeIp'] + " type " + npcNodes[node]['type'])
+                print("")
+                try:
+                    checkNode(connectNode)
+                except OSError:
+                    print("Cannot connect to node " + connectNode['nodeIp'])
+    except FileNotFoundError:
+        print("Cannot find file " + npcNodesFile)
+        enterManually()   
+except:
+    print("No argument specified")
+    enterManually()
+    
+
+    
