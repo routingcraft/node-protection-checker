@@ -737,9 +737,6 @@ try:
     except FileNotFoundError:
         print("Cannot find file " + npcNodesFile)
         enterManually()   
-except:
+except IndexError:
     print("No argument specified")
     enterManually()
-    
-
-    
