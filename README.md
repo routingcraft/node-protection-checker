@@ -238,5 +238,5 @@ There are a couple of minor issues with the code, I will fix them when I have ti
 
 * Secondary IP on interfaces are not supported
 * All IS-IS routers must advertise hostname TLV 
-
+* Only one IS-IS process, and only in the default VRF is supported
 
