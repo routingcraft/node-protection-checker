@@ -9,7 +9,6 @@ from getpass import getpass
 import sys
 
 
-
 class getIsisFacts(object):
     # receives json rpc connection object
     # calls eAPI commands on that object
