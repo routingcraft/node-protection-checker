@@ -231,3 +231,12 @@ On the other hand, backup path may include multiaccess links.
 When checking for cascading link-protection effect (**De Facto Protected SID type 2**), we don't know what TI-LFA implementation run on other routers and what SID it can protect. There are certain assumptions I have to make, which might be wrong in certain corner cases.
 
 If the PLR that is checked supports TI-LFA for a certain SID type, all other routers must also support it.
+
+## IS-IS Configuration caveats
+
+There are a couple of minor issues with the code, I will fix them when I have time.
+
+* Secondary IP on interfaces are not supported
+* All IS-IS routers must advertise hostname TLV 
+
+
